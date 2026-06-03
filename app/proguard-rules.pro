@@ -1,0 +1,2 @@
+-keep class dev.gzq.coloroscloneproxy.ColorOsCloneProxyModule { *; }
+-keep class dev.gzq.coloroscloneproxy.ModuleProps { *; }

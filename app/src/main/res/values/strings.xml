@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ColorOS VPN Fix</string>
+    <string name="module_description">Make system VPN cover ColorOS clone users.</string>
+</resources>

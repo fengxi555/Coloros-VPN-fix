@@ -1,0 +1,26 @@
+.gradle/
+build/
+**/build/
+local.properties
+captures/
+*.iml
+.idea/
+
+# Android build outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Signing material
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+keystore.properties
+signing.properties
+
+# OS files
+.DS_Store
+Thumbs.db

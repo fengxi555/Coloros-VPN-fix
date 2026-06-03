@@ -1,0 +1,32 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "dev.gzq.coloroscloneproxy"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "dev.gzq.coloroscloneproxy"
+        minSdk 26
+        targetSdk 35
+        versionCode 23
+        versionName "2.3.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+}
+
+dependencies {
+    compileOnly "io.github.libxposed:api:101.0.1"
+}
