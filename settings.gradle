@@ -3,6 +3,12 @@ pluginManagement {
         google()
         mavenCentral()
         gradlePluginPortal()
+        maven {
+            url "https://jitpack.io"
+            metadataSources {
+                artifact()
+            }
+        }
     }
 }
 
@@ -11,6 +17,12 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven {
+            url "https://jitpack.io"
+            metadataSources {
+                artifact()
+            }
+        }
     }
 }
 

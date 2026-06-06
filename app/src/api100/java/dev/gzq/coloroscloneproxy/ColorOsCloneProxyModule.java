@@ -1,6 +1,7 @@
 package dev.gzq.coloroscloneproxy;
 
 import android.content.Context;
+import android.content.Intent;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
@@ -15,9 +16,11 @@ import android.util.Range;
 import java.io.File;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -33,11 +36,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam;
-import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam;
+import io.github.libxposed.api.XposedModuleInterface.SystemServerLoadedParam;
+import io.github.libxposed.api.annotations.AfterInvocation;
+import io.github.libxposed.api.annotations.BeforeInvocation;
+import io.github.libxposed.api.annotations.XposedHooker;
 
 public final class ColorOsCloneProxyModule extends XposedModule {
     private static final String TAG = "CloneVpnFix";
-    private static final String MODULE_VERSION = "2.3.0";
+    private static final String MODULE_VERSION = "2.5";
     private static final int PER_USER_RANGE = 100000;
     private static final int FIRST_NON_SYSTEM_UID = 10000;
     private static final int LAST_NON_SYSTEM_UID = 99999;
@@ -53,14 +59,20 @@ public final class ColorOsCloneProxyModule extends XposedModule {
     private static final long CONFIG_CACHE_MS = 2000L;
     private static final int STATUS_RETRY_COUNT = 24;
     private static final long STATUS_RETRY_INTERVAL_MS = 5000L;
-
-    private final Set<String> installedHooks = ConcurrentHashMap.newKeySet();
-    private final AtomicInteger systemLogSeq = new AtomicInteger(-1);
-    private final String logBootId = Long.toString(SystemClock.elapsedRealtime());
     private static final int PRIVATE_LOG_FAILED = -1;
     private static final int PRIVATE_LOG_DISABLED = 0;
     private static final int PRIVATE_LOG_WRITTEN = 1;
+    private static final int LEGACY_LOG_FALLBACK_SIZE = 512;
+    private static final String LEGACY_SETTING_LOG_SEQ = "clonevpnfix.log.seq";
+    private static final String LEGACY_SETTING_LOG_BOOT = "clonevpnfix.log.boot";
+    private static final String LEGACY_SETTING_LOG_PREFIX = "clonevpnfix.log.";
 
+    private static volatile ColorOsCloneProxyModule activeModule;
+
+    private final XposedInterface xposedBase;
+    private final Set<String> installedHooks = ConcurrentHashMap.newKeySet();
+    private final AtomicInteger diagnosticLogSeq = new AtomicInteger(-1);
+    private final String logBootId = currentBootId();
     private volatile Config cachedConfig;
     private volatile long configCacheUntil;
     private volatile int hookedMethods;
@@ -73,29 +85,33 @@ public final class ColorOsCloneProxyModule extends XposedModule {
     private volatile boolean statusPublisherStarted;
 
     private volatile boolean privateLogAppendFailureLogged;
-    private volatile boolean privateLogEnabled;
-    private volatile boolean settingsLogFailureLogged;
+    private volatile boolean legacyLogCacheCleared;
     private volatile FileObserver dataUserObserver;
 
-    @Override
-    public void onModuleLoaded(ModuleLoadedParam param) {
+    public ColorOsCloneProxyModule(XposedInterface base, ModuleLoadedParam param) {
+        super(base, param);
+        xposedBase = base;
+        activeModule = this;
         xLog(Log.INFO, "loaded on " + getFrameworkName() + " " + getFrameworkVersion()
-                + ", api=" + getApiVersion());
-        moduleLog("onModuleLoaded framework=" + getFrameworkName() + " "
-                + getFrameworkVersion() + " api=" + getApiVersion());
+                + ", api=" + runtimeApiVersion());
+        moduleLog("module loaded process=" + param.getProcessName()
+                + " systemServer=" + param.isSystemServer()
+                + " framework=" + getFrameworkName() + " " + getFrameworkVersion()
+                + " api=" + runtimeApiVersion());
     }
 
     @Override
-    public void onSystemServerStarting(SystemServerStartingParam param) {
-        moduleLog("onSystemServerStarting framework=" + getFrameworkName() + " "
-                + getFrameworkVersion() + " api=" + getApiVersion());
-        installVpnHooks(param.getClassLoader());
-        startDataUserObserver();
-        refreshDataUserTargets("boot");
-        publishStatus("active", "hooked=" + hookedMethods + ", users=" + describeTargetUsers());
+    public void onSystemServerLoaded(SystemServerLoadedParam param) {
+        moduleLog("onSystemServerLoaded framework=" + getFrameworkName() + " "
+                + getFrameworkVersion() + " api=" + runtimeApiVersion());
+        if (installVpnHooks(param.getClassLoader())) {
+            startDataUserObserver();
+            refreshDataUserTargets("boot");
+            publishHookStatus("boot");
+        }
     }
 
-    private void installVpnHooks(ClassLoader classLoader) {
+    private boolean installVpnHooks(ClassLoader classLoader) {
         Class<?> vpnClass;
         try {
             vpnClass = Class.forName("com.android.server.connectivity.Vpn", false, classLoader);
@@ -104,7 +120,7 @@ public final class ColorOsCloneProxyModule extends XposedModule {
             xLog(Log.ERROR, "Vpn class not found", t);
             moduleLog("Vpn class not found: " + t);
             publishStatus("error", "Vpn class not found");
-            return;
+            return false;
         }
 
         int count = 0;
@@ -118,9 +134,7 @@ public final class ColorOsCloneProxyModule extends XposedModule {
             }
             try {
                 method.setAccessible(true);
-                hook(method)
-                        .setPriority(XposedInterface.PRIORITY_HIGHEST)
-                        .intercept(this::interceptUidRangeFactory);
+                hook(method, XposedInterface.PRIORITY_HIGHEST, UidRangeHooker.class);
                 count++;
                 xLog(Log.INFO, "hooked " + key);
                 moduleLog("hooked method: " + key);
@@ -130,10 +144,37 @@ public final class ColorOsCloneProxyModule extends XposedModule {
             }
         }
         hookedMethods = count;
-        moduleLog("installVpnHooks completed hookedMethods=" + count);
+        int diagnosticHooks = installVpnDiagnosticHooks(vpnClass);
+        moduleLog("installVpnHooks completed hookedMethods=" + count
+                + " diagnosticHooks=" + diagnosticHooks);
         if (count == 0) {
             publishStatus("error", "no VPN uid range method hooked");
+            return false;
         }
+        return true;
+    }
+
+    private int installVpnDiagnosticHooks(Class<?> vpnClass) {
+        int count = 0;
+        for (Method method : vpnClass.getDeclaredMethods()) {
+            if (!looksLikeVpnDiagnosticMethod(method)) {
+                continue;
+            }
+            String key = "diag:" + method.toGenericString();
+            if (!installedHooks.add(key)) {
+                continue;
+            }
+            try {
+                method.setAccessible(true);
+                hook(method, XposedInterface.PRIORITY_LOWEST, DiagnosticHooker.class);
+                count++;
+                moduleLog("hooked diagnostic method: " + method.toGenericString());
+            } catch (Throwable t) {
+                moduleLog("failed to hook diagnostic method: " + method.toGenericString()
+                        + " error=" + t);
+            }
+        }
+        return count;
     }
 
     private boolean looksLikeUidRangeFactory(Method method) {
@@ -152,36 +193,89 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         return "createuserandrestrictedprofilesranges".equals(name);
     }
 
-    private Object interceptUidRangeFactory(XposedInterface.Chain chain) throws Throwable {
-        Object result = chain.proceed();
+    private boolean looksLikeVpnDiagnosticMethod(Method method) {
+        String name = method.getName().toLowerCase(Locale.ROOT);
+        if (name.contains("range")) {
+            return false;
+        }
+        return name.contains("establish")
+                || name.contains("startnewnetworkagent")
+                || name.contains("agentconnect");
+    }
+
+    private void beforeVpnDiagnostic(Method method,
+            XposedInterface.BeforeHookCallback callback) {
+        if (!isDiagnosticLoggingEnabled()) {
+            return;
+        }
+        String methodName = method.getName();
+        moduleLog("VPN diag enter method=" + methodName
+                + " args=" + summarizeArgs(callback.getArgs()));
+    }
+
+    private void afterVpnDiagnostic(Method method,
+            XposedInterface.AfterHookCallback callback) {
+        if (!isDiagnosticLoggingEnabled()) {
+            return;
+        }
+        String methodName = method.getName();
+        Throwable throwable = callback.getThrowable();
+        moduleLog("VPN diag exit method=" + methodName
+                + (throwable == null
+                        ? " result=" + summarizeObject(callback.getResult())
+                        : " throwable=" + throwable.getClass().getSimpleName()));
+        Object thisObject = callback.getThisObject();
+        if (shouldLogVpnCaps(methodName) && thisObject != null) {
+            moduleLog("VPN diag caps method=" + methodName
+                    + " caps=" + describeNetworkCaps(thisObject));
+        }
+    }
+
+    private boolean shouldLogVpnCaps(String methodName) {
+        if (methodName == null) {
+            return false;
+        }
+        String name = methodName.toLowerCase(Locale.ROOT);
+        return name.contains("establish")
+                || name.contains("agent")
+                || name.contains("networkcap")
+                || name.contains("capabilit");
+    }
+
+    private void afterUidRangeFactory(Method method,
+            XposedInterface.AfterHookCallback callback) {
+        if (callback.getThrowable() != null) {
+            return;
+        }
+        Object result = callback.getResult();
         if (!(result instanceof Set<?>)) {
-            return result;
+            return;
         }
 
         Config config = config();
         if (!config.enabled) {
-            return result;
+            return;
         }
 
-        int sourceUserId = resolveSourceUserId(chain);
-        Object vpn = chain.getThisObject();
+        Object vpn = callback.getThisObject();
+        int sourceUserId = resolveSourceUserId(vpn, callback.getArgs());
         Set<Integer> targetUserIds = targetUserIds(config, sourceUserId, vpn);
-        moduleLog("VPN range call method=" + chain.getExecutable().getName()
+        moduleLog("VPN range call method=" + method.getName()
                 + " sourceUser=" + sourceUserId
                 + " targets=" + formatUsers(targetUserIds)
                 + " sourceRanges=" + ((Set<?>) result).size());
         if (targetUserIds.isEmpty()) {
-            return result;
+            return;
         }
 
         Set<?> sourceRanges = (Set<?>) result;
         moduleLog("VPN source ranges=" + summarizeRanges(sourceRanges));
-        moduleLog("VPN config=" + describeVpnConfig(chain.getThisObject()));
-        moduleLog("VPN netcaps(pre)=" + describeNetworkCaps(chain.getThisObject()));
+        moduleLog("VPN config=" + describeVpnConfig(vpn));
+        moduleLog("VPN netcaps(pre)=" + describeNetworkCaps(vpn));
         moduleLog("Via data dirs=" + describeViaDataDirs(targetUserIds));
         moduleLog("Via proc uids=" + describeViaProcesses());
         Set<Object> expanded = expandRanges(sourceRanges, sourceUserId, targetUserIds,
-                readAllowedApplications(vpn), vpnContext(vpn));
+                readAllowedApplications(vpn), readDisallowedApplications(vpn), vpnContext(vpn));
         int added = expanded.size() - sourceRanges.size();
         moduleLog("VPN range expand sourceUser=" + sourceUserId
                 + " targetUsers=" + formatUsers(targetUserIds)
@@ -190,7 +284,7 @@ public final class ColorOsCloneProxyModule extends XposedModule {
                 + " after=" + expanded.size());
         moduleLog("VPN range overlap=" + describeOverlaps(expanded));
         if (added <= 0) {
-            return result;
+            return;
         }
 
         lastExpandedRanges = added;
@@ -199,11 +293,50 @@ public final class ColorOsCloneProxyModule extends XposedModule {
             xLog(Log.INFO, "expanded VPN uid ranges by " + added
                     + " for users " + formatUsers(targetUserIds));
         }
-        return expanded;
+        callback.setResult(expanded);
+    }
+
+    @XposedHooker
+    public static final class UidRangeHooker implements XposedInterface.Hooker {
+        private UidRangeHooker() {
+        }
+
+        @AfterInvocation
+        public static void after(XposedInterface.AfterHookCallback callback) {
+            ColorOsCloneProxyModule module = activeModule;
+            Member member = callback.getMember();
+            if (module != null && member instanceof Method) {
+                module.afterUidRangeFactory((Method) member, callback);
+            }
+        }
+    }
+
+    @XposedHooker
+    public static final class DiagnosticHooker implements XposedInterface.Hooker {
+        private DiagnosticHooker() {
+        }
+
+        @BeforeInvocation
+        public static void before(XposedInterface.BeforeHookCallback callback) {
+            ColorOsCloneProxyModule module = activeModule;
+            Member member = callback.getMember();
+            if (module != null && member instanceof Method) {
+                module.beforeVpnDiagnostic((Method) member, callback);
+            }
+        }
+
+        @AfterInvocation
+        public static void after(XposedInterface.AfterHookCallback callback) {
+            ColorOsCloneProxyModule module = activeModule;
+            Member member = callback.getMember();
+            if (module != null && member instanceof Method) {
+                module.afterVpnDiagnostic((Method) member, callback);
+            }
+        }
     }
 
     private Set<Object> expandRanges(Set<?> sourceRanges, int sourceUserId, Set<Integer> targets,
-            List<String> allowedApplications, Context context) {
+            List<String> allowedApplications, List<String> disallowedApplications, Context context) {
         Set<Object> expanded = new LinkedHashSet<>();
         Object template = null;
         List<String> samples = new ArrayList<>();
@@ -220,6 +353,9 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         }
 
         boolean useAllowedApplications = allowedApplications != null;
+        boolean useDisallowedApplications = !useAllowedApplications
+                && disallowedApplications != null
+                && !disallowedApplications.isEmpty();
         for (int userId : targets) {
             if (userId == sourceUserId) {
                 continue;
@@ -228,12 +364,15 @@ public final class ColorOsCloneProxyModule extends XposedModule {
                 addAllowedApplicationRanges(expanded, template, samples, context, userId,
                         allowedApplications);
             } else {
-                addTargetUserRange(expanded, template, samples, userId,
-                        FIRST_NON_SYSTEM_UID, LAST_NON_SYSTEM_UID);
+                addMirroredSourceRanges(expanded, template, samples, sourceRanges, sourceUserId, userId);
             }
         }
-        moduleLog("range strategy=" + (useAllowedApplications ? "allowed-apps" : "non-system-uid")
-                + (useAllowedApplications ? ", packages=" + allowedApplications.size() : "")
+        String strategy = useAllowedApplications ? "allowed-apps"
+                : (useDisallowedApplications ? "mirror-source-disallowed" : "mirror-source");
+        int packageCount = useAllowedApplications ? allowedApplications.size()
+                : (useDisallowedApplications ? disallowedApplications.size() : 0);
+        moduleLog("range strategy=" + strategy
+                + (packageCount > 0 ? ", packages=" + packageCount : "")
                 + ", addedSamples=" + joinSamples(samples, 12));
         return expanded;
     }
@@ -266,6 +405,9 @@ public final class ColorOsCloneProxyModule extends XposedModule {
 
     private void addRawUidRange(Set<Object> ranges, Object template, List<String> samples,
             int start, int stop) {
+        if (start > stop) {
+            return;
+        }
         Object newRange = createUidRangeLike(template, start, stop);
         if (newRange != null) {
             ranges.add(newRange);
@@ -281,6 +423,26 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         int start = userBase + appStart;
         int stop = userBase + appStop;
         addRawUidRange(ranges, template, samples, start, stop);
+    }
+
+    private void addMirroredSourceRanges(Set<Object> ranges, Object template, List<String> samples,
+            Set<?> sourceRanges, int sourceUserId, int targetUserId) {
+        int sourceBase = sourceUserId * PER_USER_RANGE;
+        int sourceMin = sourceBase + FIRST_NON_SYSTEM_UID;
+        int sourceMax = sourceBase + LAST_NON_SYSTEM_UID;
+        for (Object raw : sourceRanges) {
+            UidRange source = readUidRange(raw);
+            if (source == null) {
+                continue;
+            }
+            int start = Math.max(source.start, sourceMin);
+            int stop = Math.min(source.stop, sourceMax);
+            if (start > stop) {
+                continue;
+            }
+            addTargetUserRange(ranges, template, samples, targetUserId,
+                    start - sourceBase, stop - sourceBase);
+        }
     }
 
     private List<Integer> appUidsForUser(Context context, List<String> packageNames, int userId) {
@@ -369,6 +531,45 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         }
         return "count=" + ranges.size() + ", readable=" + readable
                 + ", samples=" + joinSamples(samples, 12);
+    }
+
+    private String summarizeArgs(Object[] args) {
+        return summarizeArgs(args == null ? null : Arrays.asList(args));
+    }
+
+    private String summarizeArgs(List<Object> args) {
+        if (args == null || args.isEmpty()) {
+            return "none";
+        }
+        List<String> samples = new ArrayList<>();
+        int count = Math.min(args.size(), 8);
+        for (int i = 0; i < count; i++) {
+            samples.add(i + "=" + summarizeObject(args.get(i)));
+        }
+        return "count=" + args.size() + " " + joinSamples(samples, 8);
+    }
+
+    private String summarizeObject(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        if (value instanceof String || value instanceof Number || value instanceof Boolean) {
+            return shortenCmdline(String.valueOf(value));
+        }
+        if (value instanceof Set<?>) {
+            return "Set(size=" + ((Set<?>) value).size() + ")";
+        }
+        if (value instanceof List<?>) {
+            return "List(size=" + ((List<?>) value).size() + ")";
+        }
+        if (looksLikeNetworkCapabilities(value)) {
+            return "NetworkCapabilities(" + describeNetworkCapabilitiesObject(value) + ")";
+        }
+        UidRange range = readUidRange(value);
+        if (range != null) {
+            return range.start + "-" + range.stop;
+        }
+        return value.getClass().getSimpleName();
     }
 
     private String joinSamples(List<String> samples, int limit) {
@@ -487,6 +688,10 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         if (caps == null) {
             return "null";
         }
+        return describeNetworkCapabilitiesObject(caps);
+    }
+
+    private String describeNetworkCapabilitiesObject(Object caps) {
         Object uidRanges = readField(caps, "mUids");
         if (uidRanges == null) {
             return "mUids-null";
@@ -497,7 +702,7 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         Set<?> set = (Set<?>) uidRanges;
         List<String> samples = new ArrayList<>();
         for (Object raw : set) {
-            if (samples.size() >= 16) {
+            if (samples.size() >= 32) {
                 break;
             }
             UidRange range = readUidRange(raw);
@@ -507,12 +712,32 @@ public final class ColorOsCloneProxyModule extends XposedModule {
                 samples.add(String.valueOf(raw));
             }
         }
-        return "count=" + set.size() + ", samples=" + joinSamples(samples, 16);
+        return "count=" + set.size() + ", samples=" + joinSamples(samples, 32);
+    }
+
+    private boolean looksLikeNetworkCapabilities(Object value) {
+        return value != null && "android.net.NetworkCapabilities".equals(value.getClass().getName());
     }
 
     private List<String> readAllowedApplications(Object vpn) {
         Object config = readField(vpn, "mConfig");
         Object value = readField(config, "allowedApplications");
+        if (!(value instanceof List<?>)) {
+            return null;
+        }
+
+        List<String> result = new ArrayList<>();
+        for (Object item : (List<?>) value) {
+            if (item instanceof String) {
+                result.add((String) item);
+            }
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    private List<String> readDisallowedApplications(Object vpn) {
+        Object config = readField(vpn, "mConfig");
+        Object value = readField(config, "disallowedApplications");
         if (!(value instanceof List<?>)) {
             return null;
         }
@@ -534,17 +759,17 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         return getSystemContext();
     }
 
-    private int resolveSourceUserId(XposedInterface.Chain chain) {
-        for (Object arg : chain.getArgs()) {
-            if (arg instanceof Integer) {
-                int userId = (Integer) arg;
-                if (userId >= 0 && userId < 10000) {
-                    return userId;
+    private int resolveSourceUserId(Object thisObject, Object[] args) {
+        if (args != null) {
+            for (Object arg : args) {
+                if (arg instanceof Integer) {
+                    int userId = (Integer) arg;
+                    if (userId >= 0 && userId < 10000) {
+                        return userId;
+                    }
                 }
             }
         }
-
-        Object thisObject = chain.getThisObject();
         Integer userId = readIntField(thisObject, "mUserId");
         return userId == null ? 0 : userId;
     }
@@ -822,12 +1047,13 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         }
 
         refreshDataUserTargets(dataUserEventName(event) + ":" + userId);
-        Set<Integer> targets = targetUserIds(config(), 0, null);
+        Config current = config();
+        Set<Integer> targets = targetUserIds(current, 0, null);
         moduleLog("/data/user changed event=" + dataUserEventName(event)
                 + " user=" + userId
                 + " targets=" + formatUsers(targets)
                 + " vpnRangeRefresh=requires-vpn-recreate");
-        publishStatus("active", "hooked=" + hookedMethods + ", users=" + formatUsers(targets));
+        publishHookStatus("users=" + formatUsers(targets));
     }
 
     private String dataUserEventName(int event) {
@@ -917,6 +1143,25 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         }
     }
 
+    private void publishHookStatus(String reason) {
+        Config current = config();
+        if (!current.enabled) {
+            publishStatus("inactive", "module disabled");
+            return;
+        }
+        if (hookedMethods <= 0) {
+            publishStatus("error", "no VPN uid range method hooked");
+            return;
+        }
+
+        Set<Integer> targets = targetUserIds(current, 0, null);
+        String detail = "hooked=" + hookedMethods + ", users=" + formatUsers(targets);
+        if (reason != null && !reason.isEmpty()) {
+            detail += ", reason=" + reason;
+        }
+        publishStatus("active", detail);
+    }
+
     private void startStatusPublisher() {
         if (statusPublisherStarted) {
             return;
@@ -946,24 +1191,26 @@ public final class ColorOsCloneProxyModule extends XposedModule {
     private boolean writeStatusSnapshot() {
         String active = "active".equals(lastState) ? "1" : "0";
         String framework = getFrameworkName() + " " + getFrameworkVersion();
-        String api = String.valueOf(getApiVersion());
+        String api = String.valueOf(runtimeApiVersion());
         String hooks = String.valueOf(hookedMethods);
         String ranges = String.valueOf(lastExpandedRanges);
-        String bootId = String.valueOf(SystemClock.elapsedRealtime());
+        String bootId = logBootId;
         String detail = statusDetail();
 
-        boolean wrote = false;
-        wrote |= putStatus(ModuleProps.SETTING_ACTIVE, ModuleProps.PROP_ACTIVE, active);
-        wrote |= putStatus(ModuleProps.SETTING_STATE, ModuleProps.PROP_STATE, lastState);
-        wrote |= putStatus(ModuleProps.SETTING_DETAIL, ModuleProps.PROP_DETAIL, detail);
-        wrote |= putStatus(ModuleProps.SETTING_VERSION, ModuleProps.PROP_VERSION, MODULE_VERSION);
-        wrote |= putStatus(ModuleProps.SETTING_API, ModuleProps.PROP_API, api);
-        wrote |= putStatus(ModuleProps.SETTING_FRAMEWORK, ModuleProps.PROP_FRAMEWORK, framework);
-        wrote |= putStatus(ModuleProps.SETTING_HOOKS, ModuleProps.PROP_HOOKS, hooks);
-        wrote |= putStatus(ModuleProps.SETTING_EXPANDED_RANGES, ModuleProps.PROP_EXPANDED_RANGES, ranges);
-        wrote |= putStatus(ModuleProps.SETTING_USERS, ModuleProps.PROP_USERS, lastTargetUsers);
-        wrote |= putStatus(ModuleProps.SETTING_BOOT_ID, ModuleProps.PROP_BOOT_ID, bootId);
-        return wrote;
+        Context context = getSystemContext();
+        boolean wroteSettings = false;
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_ACTIVE, ModuleProps.PROP_ACTIVE, active);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_STATE, ModuleProps.PROP_STATE, lastState);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_DETAIL, ModuleProps.PROP_DETAIL, detail);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_VERSION, ModuleProps.PROP_VERSION, MODULE_VERSION);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_API, ModuleProps.PROP_API, api);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_FRAMEWORK, ModuleProps.PROP_FRAMEWORK, framework);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_HOOKS, ModuleProps.PROP_HOOKS, hooks);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_EXPANDED_RANGES, ModuleProps.PROP_EXPANDED_RANGES, ranges);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_USERS, ModuleProps.PROP_USERS, lastTargetUsers);
+        wroteSettings |= putStatus(context, ModuleProps.SETTING_BOOT_ID, ModuleProps.PROP_BOOT_ID, bootId);
+        clearLegacySystemLogCache(context);
+        return wroteSettings;
     }
 
     private String statusDetail() {
@@ -976,19 +1223,21 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         return "hooked=" + hookedMethods + ", users=" + lastTargetUsers;
     }
 
-    private boolean putStatus(String settingKey, String propKey, String value) {
+    private boolean putStatus(Context context, String settingKey, String propKey, String value) {
         boolean wrote = setProp(propKey, value);
-        Context context = getSystemContext();
         if (context == null) {
             return wrote;
         }
+        long identity = Binder.clearCallingIdentity();
         try {
             Settings.Global.putString(context.getContentResolver(), settingKey, value);
-            wrote = true;
+            return true;
         } catch (Throwable ignored) {
             // Best effort status only; routing Hook does not depend on this.
+            return wrote;
+        } finally {
+            Binder.restoreCallingIdentity(identity);
         }
-        return wrote;
     }
 
     private Context getSystemContext() {
@@ -1002,6 +1251,26 @@ public final class ColorOsCloneProxyModule extends XposedModule {
             return context instanceof Context ? (Context) context : null;
         } catch (Throwable ignored) {
             return null;
+        }
+    }
+
+    private void clearLegacySystemLogCache(Context context) {
+        if (legacyLogCacheCleared || context == null) {
+            return;
+        }
+        legacyLogCacheCleared = true;
+        long identity = Binder.clearCallingIdentity();
+        try {
+            Settings.Global.putString(context.getContentResolver(), LEGACY_SETTING_LOG_SEQ, null);
+            Settings.Global.putString(context.getContentResolver(), LEGACY_SETTING_LOG_BOOT, null);
+            for (int i = 0; i < LEGACY_LOG_FALLBACK_SIZE; i++) {
+                Settings.Global.putString(context.getContentResolver(),
+                        LEGACY_SETTING_LOG_PREFIX + i, null);
+            }
+        } catch (Throwable ignored) {
+            // Legacy cleanup only; current logging no longer depends on Settings.Global.
+        } finally {
+            Binder.restoreCallingIdentity(identity);
         }
     }
 
@@ -1085,102 +1354,139 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         return "1".equals(value) || "true".equals(value) || "yes".equals(value) || "on".equals(value);
     }
 
+    private int runtimeApiVersion() {
+        try {
+            Method method = xposedBase.getClass().getMethod("getApiVersion");
+            Object value = method.invoke(xposedBase);
+            if (value instanceof Number) {
+                return ((Number) value).intValue();
+            }
+        } catch (Throwable ignored) {
+            // API 100 frameworks usually do not expose the 101-style runtime API method.
+        }
+        try {
+            Method method = xposedBase.getClass().getMethod("getAPIVersion");
+            Object value = method.invoke(xposedBase);
+            if (value instanceof Number) {
+                return ((Number) value).intValue();
+            }
+        } catch (Throwable ignored) {
+            // Fall through to the API 100 wrapper value.
+        }
+        return XposedInterface.API;
+    }
+
     private void xLog(int priority, String message) {
-        log(priority, TAG, message);
+        Log.println(priority, TAG, message);
+        log(TAG + "/" + priority + ": " + message);
     }
 
     private void xLog(int priority, String message, Throwable throwable) {
-        log(priority, TAG, message, throwable);
+        Log.println(priority, TAG, message + "\n" + Log.getStackTraceString(throwable));
+        log(TAG + "/" + priority + ": " + message, throwable);
     }
 
     private void moduleLog(String message) {
-        int privateLog = appendPrivateLog(message);
-        if (privateLog != PRIVATE_LOG_FAILED) {
-            return;
-        }
-        if (!privateLogEnabled) {
-            return;
-        }
-        systemLog(message);
+        diagnosticLog(message, config().log);
     }
 
-    private int appendPrivateLog(String message) {
+    private boolean isDiagnosticLoggingEnabled() {
+        return true;
+    }
+
+    private void diagnosticLog(String message, boolean forceXposedLog) {
+        int seq = nextDiagnosticLogSeq();
+        String line = shortenSystemLog("boot=" + logBootId
+                + " seq=" + seq
+                + " t=" + SystemClock.elapsedRealtime()
+                + " " + message);
+
+        int privateLog = appendPrivateLog(line);
+        if (privateLog == PRIVATE_LOG_WRITTEN) {
+            return;
+        }
+        if (forceXposedLog) {
+            xLog(Log.INFO, "diag seq=" + seq + " privateLog=" + privateLog + " " + line);
+        }
+    }
+
+    private int appendPrivateLog(String line) {
         Context context = getSystemContext();
         if (context == null) {
             return PRIVATE_LOG_FAILED;
         }
+        long identity = Binder.clearCallingIdentity();
         try {
             Bundle extras = new Bundle();
-            extras.putString(ModuleProps.LOG_EXTRA_MESSAGE, message);
+            extras.putString(ModuleProps.LOG_EXTRA_MESSAGE, line);
             Bundle result = context.getContentResolver().call(
                     Uri.parse("content://" + ModuleProps.LOG_AUTHORITY),
                     ModuleProps.LOG_METHOD_APPEND,
                     null,
                     extras);
             if (result == null) {
-                logPrivateAppendFailure("private log append returned null result");
-                return PRIVATE_LOG_FAILED;
+                logPrivateAppendFailure("private log append returned null");
+                return appendPrivateLogViaBroadcast(context, line);
             }
+
             boolean enabled = result.getBoolean(ModuleProps.LOG_EXTRA_ENABLED, false);
             boolean ok = result.getBoolean(ModuleProps.LOG_EXTRA_OK, false);
-            privateLogEnabled = enabled;
             if (!enabled) {
                 return PRIVATE_LOG_DISABLED;
             }
             if (!ok) {
                 logPrivateAppendFailure("private log append returned ok=false");
-                return PRIVATE_LOG_FAILED;
+                return appendPrivateLogViaBroadcast(context, line);
             }
             return PRIVATE_LOG_WRITTEN;
         } catch (Throwable ignored) {
-            if (!privateLogAppendFailureLogged) {
-                privateLogAppendFailureLogged = true;
-                xLog(Log.WARN, "private log provider call failed", ignored);
-            }
-            return PRIVATE_LOG_FAILED;
+            logPrivateAppendFailure("private log provider call failed");
+            return appendPrivateLogViaBroadcast(context, line);
+        } finally {
+            Binder.restoreCallingIdentity(identity);
         }
     }
 
-    private void systemLog(String message) {
-        Context context = getSystemContext();
-        if (context == null) {
+    private int appendPrivateLogViaBroadcast(Context context, String line) {
+        long identity = Binder.clearCallingIdentity();
+        try {
+            Intent intent = new Intent(ModuleProps.LOG_ACTION_APPEND);
+            intent.setClassName(ModuleProps.PACKAGE_NAME, ModuleProps.LOG_RECEIVER_CLASS);
+            intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND
+                    | Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            intent.putExtra(ModuleProps.LOG_EXTRA_MESSAGE, line);
+            intent.putExtra(ModuleProps.LOG_EXTRA_CALLER_UID, android.os.Process.SYSTEM_UID);
+            context.sendBroadcast(intent);
+            return PRIVATE_LOG_WRITTEN;
+        } catch (Throwable ignored) {
+            logPrivateAppendFailure("private log broadcast fallback failed");
+            return PRIVATE_LOG_FAILED;
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+    }
+
+    private void logPrivateAppendFailure(String message) {
+        if (privateLogAppendFailureLogged) {
             return;
         }
-        int seq = nextSystemLogSeq();
-        int slot = seq % ModuleProps.LOG_FALLBACK_SIZE;
-        String line = shortenSystemLog("boot=" + logBootId
-                + " seq=" + seq
-                + " t=" + SystemClock.elapsedRealtime()
-                + " " + message);
-
-        try {
-            Settings.Global.putString(context.getContentResolver(),
-                    ModuleProps.SETTING_LOG_BOOT, logBootId);
-            Settings.Global.putString(context.getContentResolver(),
-                    ModuleProps.SETTING_LOG_PREFIX + slot, line);
-            Settings.Global.putString(context.getContentResolver(),
-                    ModuleProps.SETTING_LOG_SEQ, String.valueOf(seq));
-        } catch (Throwable ignored) {
-            if (!settingsLogFailureLogged) {
-                settingsLogFailureLogged = true;
-                xLog(Log.WARN, "Settings.Global system log write failed", ignored);
-            }
-        }
+        privateLogAppendFailureLogged = true;
+        xLog(Log.WARN, message);
     }
 
-    private int nextSystemLogSeq() {
-        int current = systemLogSeq.get();
+    private int nextDiagnosticLogSeq() {
+        int current = diagnosticLogSeq.get();
         if (current >= 0) {
-            return systemLogSeq.incrementAndGet();
+            return diagnosticLogSeq.incrementAndGet();
         }
 
-        synchronized (systemLogSeq) {
-            current = systemLogSeq.get();
+        synchronized (diagnosticLogSeq) {
+            current = diagnosticLogSeq.get();
             if (current >= 0) {
-                return systemLogSeq.incrementAndGet();
+                return diagnosticLogSeq.incrementAndGet();
             }
-            systemLogSeq.set(-1);
-            return systemLogSeq.incrementAndGet();
+            diagnosticLogSeq.set(-1);
+            return diagnosticLogSeq.incrementAndGet();
         }
     }
 
@@ -1276,7 +1582,12 @@ public final class ColorOsCloneProxyModule extends XposedModule {
         return -1;
     }
 
-    private String readSmallFile(File file, int maxBytes) {
+    private static String currentBootId() {
+        String bootId = readSmallFile(new File("/proc/sys/kernel/random/boot_id"), 128).trim();
+        return bootId.isEmpty() ? Long.toString(SystemClock.elapsedRealtime()) : bootId;
+    }
+
+    private static String readSmallFile(File file, int maxBytes) {
         byte[] buffer = new byte[maxBytes];
         try (java.io.FileInputStream input = new java.io.FileInputStream(file)) {
             int read = input.read(buffer);
@@ -1294,13 +1605,6 @@ public final class ColorOsCloneProxyModule extends XposedModule {
             return "";
         }
         return value.length() > 80 ? value.substring(0, 80) : value;
-    }
-
-    private void logPrivateAppendFailure(String message) {
-        if (!privateLogAppendFailureLogged) {
-            privateLogAppendFailureLogged = true;
-            xLog(Log.WARN, message);
-        }
     }
 
     private static final class Config {

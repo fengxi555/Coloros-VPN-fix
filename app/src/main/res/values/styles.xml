@@ -1,20 +1,24 @@
 <resources>
     <style name="CloneVpnFixTheme" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:windowAnimationStyle">@style/CloneVpnFixNoAnimation</item>
+        <item name="android:windowAnimationStyle">@style/CloneVpnFixWindowAnimation</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:colorAccent">#65E7A6</item>
+        <item name="android:navigationBarColor">#EDF7F4</item>
+        <item name="android:statusBarColor">#FAFDFC</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
     </style>
 
-    <style name="CloneVpnFixNoAnimation">
-        <item name="android:activityOpenEnterAnimation">@null</item>
-        <item name="android:activityOpenExitAnimation">@null</item>
-        <item name="android:activityCloseEnterAnimation">@null</item>
-        <item name="android:activityCloseExitAnimation">@null</item>
-        <item name="android:taskOpenEnterAnimation">@null</item>
-        <item name="android:taskOpenExitAnimation">@null</item>
-        <item name="android:taskCloseEnterAnimation">@null</item>
-        <item name="android:taskCloseExitAnimation">@null</item>
-        <item name="android:taskToFrontEnterAnimation">@null</item>
-        <item name="android:taskToFrontExitAnimation">@null</item>
-        <item name="android:taskToBackEnterAnimation">@null</item>
-        <item name="android:taskToBackExitAnimation">@null</item>
+    <style name="CloneVpnFixWindowAnimation">
+        <item name="android:activityOpenEnterAnimation">@anim/clone_vpn_fade_in</item>
+        <item name="android:activityOpenExitAnimation">@anim/clone_vpn_fade_out</item>
+        <item name="android:activityCloseEnterAnimation">@anim/clone_vpn_fade_in</item>
+        <item name="android:activityCloseExitAnimation">@anim/clone_vpn_fade_out</item>
+        <item name="android:taskOpenEnterAnimation">@anim/clone_vpn_fade_in</item>
+        <item name="android:taskOpenExitAnimation">@anim/clone_vpn_fade_out</item>
+        <item name="android:taskCloseEnterAnimation">@anim/clone_vpn_fade_in</item>
+        <item name="android:taskCloseExitAnimation">@anim/clone_vpn_fade_out</item>
     </style>
 </resources>
