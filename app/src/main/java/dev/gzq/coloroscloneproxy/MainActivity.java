@@ -36,7 +36,7 @@ public final class MainActivity extends Activity {
     static final String EXTRA_INITIAL_TAB = "dev.gzq.coloroscloneproxy.extra.INITIAL_TAB";
     static final String TAB_SETTINGS_VALUE = "settings";
 
-    private static final String MODULE_VERSION = "2.5";
+    private static final String MODULE_VERSION = "2.6";
     private static final int REQUEST_EXPORT_LOG = 1001;
     private static final int TAB_HOME = 0;
     private static final int TAB_SETTINGS = 1;

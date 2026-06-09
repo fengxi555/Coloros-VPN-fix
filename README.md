@@ -8,7 +8,7 @@
 
 ## 版本选择
 
-2.5 起同时提供两个构建版本：
+2.6 同时提供两个构建版本：
 
 - `API101`：推荐版本，适用于支持 libxposed API 101 的 LSPosed、Vector 等框架。
 - `API100`：兼容版本，适用于只支持 libxposed API 100 的框架。
@@ -21,7 +21,7 @@
 - 默认作用域仅为 `system`。
 - 优先通过 ColorOS/Android `UserManager` 内部接口发现 alive users。
 - `UserManager` 不可用时回退扫描 `/data/user`。
-- 只针对 ColorOS 分身常见用户 ID 范围 `900-999`。
+- 只针对非主用户候选 ID 范围 `10-999`，主用户 `0` 不作为目标。
 - VPN 未限制应用时，为分身用户扩展非系统应用 UID 范围。
 - VPN 使用 `allowedApplications` 或 `disallowedApplications` 时，按包名为目标分身用户映射 UID range。
 - 支持可用时的 SDK sandbox UID 映射。
@@ -40,8 +40,8 @@
 ## 使用方法
 
 1. 安装对应版本 APK：
-   - API 101 框架安装 `ColorOS-VPN-fix-2.5-API101-Release.apk`。
-   - API 100 框架安装 `ColorOS-VPN-fix-2.5-API100-Release.apk`。
+   - API 101 框架安装 `ColorOS-VPN-fix-2.6-API101-Release.apk`。
+   - API 100 框架安装 `ColorOS-VPN-fix-2.6-API100-Release.apk`。
 2. 在 LSPosed/Vector 中启用模块。
 3. 作用域只勾选 `system`。
 4. 重启设备。
@@ -92,8 +92,8 @@ gradle :app:assembleRelease
 
 构建产物位于：
 
-- `app/build/outputs/apk/api101/release/ColorOS-VPN-fix-2.5-API101-Release.apk`
-- `app/build/outputs/apk/api100/release/ColorOS-VPN-fix-2.5-API100-Release.apk`
+- `app/build/outputs/apk/api101/release/ColorOS-VPN-fix-2.6-API101-Release.apk`
+- `app/build/outputs/apk/api100/release/ColorOS-VPN-fix-2.6-API100-Release.apk`
 
 Release 构建需要自行在仓库外配置签名。签名文件和生成的 APK 不会提交到仓库。
 

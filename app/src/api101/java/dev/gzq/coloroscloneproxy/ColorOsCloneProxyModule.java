@@ -39,14 +39,14 @@ import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam;
 
 public final class ColorOsCloneProxyModule extends XposedModule {
     private static final String TAG = "CloneVpnFix";
-    private static final String MODULE_VERSION = "2.5";
+    private static final String MODULE_VERSION = "2.6";
     private static final int PER_USER_RANGE = 100000;
     private static final int FIRST_NON_SYSTEM_UID = 10000;
     private static final int LAST_NON_SYSTEM_UID = 99999;
     private static final int FIRST_APPLICATION_UID = 10000;
     private static final int LAST_APPLICATION_UID = 19999;
     private static final int FIRST_SDK_SANDBOX_UID = 20000;
-    private static final int COLOROS_CLONE_MIN_USER = 900;
+    private static final int COLOROS_CLONE_MIN_USER = 10;
     private static final int COLOROS_CLONE_MAX_USER = 999;
     private static final int DATA_USER_WATCH_EVENTS = FileObserver.CREATE
             | FileObserver.DELETE
